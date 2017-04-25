@@ -129,6 +129,10 @@ InnoDB:
 #include <string.h> /* strlen(), strrchr(), strncmp() */
 
 #include "my_global.h" /* needed for headers from mysql/psi/ */
+#if !defined(DBUG_OFF) && defined(HAVE_MADVISE)
+#include <sys/mman.h>
+#endif
+
 /* JAN: TODO: missing 5.7 header */
 #ifdef HAVE_MYSQL_MEMORY_H
 #include "mysql/psi/mysql_memory.h" /* PSI_MEMORY_CALL() */
@@ -295,6 +299,9 @@ public:
 	@param[in]	file		file name of the caller
 	@param[in]	set_to_zero	if true, then the returned memory is
 	initialized with 0x0 bytes.
+	@param[in]	throw_on_error	if true, raize exception if too big
+	@param[in]	dontdump	if true, advise the OS not to core
+	dump this memory.
 	@return pointer to the allocated memory */
 	pointer
 	allocate(
@@ -302,7 +309,8 @@ public:
 		const_pointer	hint = NULL,
 		const char*	file = NULL,
 		bool		set_to_zero = false,
-		bool		throw_on_error = true)
+		bool		throw_on_error = true,
+		bool		dontdump = false)
 	{
 		if (n_elements == 0) {
 			return(NULL);
@@ -356,6 +364,14 @@ public:
 				return(NULL);
 			}
 		}
+#if defined(DBUG_OFF) && defined(HAVE_MADVISE) && defined(MADV_DONTDUMP)
+		else if (dontdump && madvise(ptr, total_bytes, MADV_DONTDUMP))
+		{
+			ib::warn() << "Failed to set memory to DONTDUMP: "
+								 << strerror(errno);
+		}
+#endif
+
 
 #ifdef UNIV_PFS_MEMORY
 		ut_new_pfx_t*	pfx = static_cast<ut_new_pfx_t*>(ptr);
@@ -568,14 +584,21 @@ public:
 	objects of type 'T' and trace the allocation.
 	@param[in]	n_elements	number of elements
 	@param[out]	pfx		storage for the description of the
-	allocated memory. The caller must provide space for this one and keep
+	allocated memory.
+	@param[in]	set_to_zero	if true, then the returned memory is
+	initialized with 0x0 bytes.
+	@param[in]      dontdump        if true, advise the OS is not to core
+	dump this memory.
+        The caller must provide space for this one and keep
 	it until the memory is no longer needed and then pass it to
 	deallocate_large().
 	@return pointer to the allocated memory or NULL */
 	pointer
 	allocate_large(
 		size_type	n_elements,
-		ut_new_pfx_t*	pfx)
+		ut_new_pfx_t*	pfx,
+		bool		set_to_zero = false,
+		bool		dontdump = false)
 	{
 		if (n_elements == 0 || n_elements > max_size()) {
 			return(NULL);
@@ -586,13 +609,23 @@ public:
 		pointer	ptr = reinterpret_cast<pointer>(
 			os_mem_alloc_large(&n_bytes));
 
+		if (set_to_zero)
+		{
+			::memset(ptr, 1, n_bytes);
+		}
+#if defined(DBUG_OFF) && defined(HAVE_MADVISE) && defined(MADV_DONTDUMP)
+		if (ptr && dontdump && madvise(ptr, n_bytes, MADV_DONTDUMP))
+                {
+			ib::warn() << "Failed to set memory to DONTDUMP: "
+                                                                << strerror(errno);
+                }
+#endif
 #ifdef UNIV_PFS_MEMORY
 		if (ptr != NULL) {
 			allocate_trace(n_bytes, NULL, pfx);
 		}
-#else
-		pfx->m_size = n_bytes;
 #endif /* UNIV_PFS_MEMORY */
+		pfx->m_size = n_bytes;
 
 		return(ptr);
 	}
@@ -601,16 +634,26 @@ public:
 	deallocation.
 	@param[in,out]	ptr	pointer to memory to free
 	@param[in]	pfx	descriptor of the memory, as returned by
-	allocate_large(). */
+	allocate_large().
+	@param[in]      dodump  if true, advise the OS to dump
+	dump this memory again if a core dump occurs. */
 	void
 	deallocate_large(
 		pointer			ptr,
-		const ut_new_pfx_t*	pfx)
+		const ut_new_pfx_t*	pfx,
+		bool			dodump = false)
 	{
 #ifdef UNIV_PFS_MEMORY
 		deallocate_trace(pfx);
 #endif /* UNIV_PFS_MEMORY */
 
+#if defined(DBUG_OFF) && defined(HAVE_MADVISE) && defined(MADV_DODUMP)
+		if (dodump && madvise(ptr, pfx->m_size, MADV_DODUMP))
+                {
+			ib::warn() << "Failed to set memory to DODUMP: "
+                                                                << strerror(errno);
+                }
+#endif
 		os_mem_free_large(ptr, pfx->m_size);
 	}
 
@@ -843,9 +886,17 @@ ut_delete_array(
 	ut_allocator<byte>(key).allocate( \
 		n_bytes, NULL, __FILE__, false, false))
 
+#define ut_malloc_dontdump(n_bytes, key) static_cast<void*>( \
+	ut_allocator<byte>(key).allocate_large( \
+		n_bytes, false, true))
+
 #define ut_zalloc(n_bytes, key)		static_cast<void*>( \
 	ut_allocator<byte>(key).allocate( \
 		n_bytes, NULL, __FILE__, true, false))
+
+#define ut_zalloc_dontdump(n_bytes, key) static_cast<void*>( \
+	ut_allocator<byte>(key).allocate_large( \
+		n_bytes, true, true))
 
 #define ut_malloc_nokey(n_bytes)	static_cast<void*>( \
 	ut_allocator<byte>(PSI_NOT_INSTRUMENTED).allocate( \
@@ -865,6 +916,10 @@ ut_delete_array(
 
 #define ut_free(ptr)	ut_allocator<byte>(PSI_NOT_INSTRUMENTED).deallocate( \
 	reinterpret_cast<byte*>(ptr))
+
+#define ut_free_dodump(ptr, key) static_cast<void*>( \
+	ut_allocator<byte>(key).deallocate_large( \
+		ptr, key, true))
 
 #else /* UNIV_PFS_MEMORY */
 
@@ -888,13 +943,68 @@ ut_delete_array(
 
 #define ut_malloc_nokey(n_bytes)	::malloc(n_bytes)
 
+static inline void *ut_malloc_dontdump(ulint n_bytes, ut_new_pfx_t *key)
+{
+	void *ptr = os_mem_alloc_large(&n_bytes);
+	key->m_size = n_bytes;
+	if (ptr)
+	{
+#if defined(DBUG_OFF) && defined(HAVE_MADVISE) && defined(MADV_DONTDUMP)
+		if (madvise(ptr, n_bytes, MADV_DONTDUMP))
+		{
+			ib::warn() << "Failed to set memory to DONTDUMP: " << strerror(errno);
+		}
+#endif
+#ifdef UNIV_PFS_MEMORY
+		allocate_trace(n_bytes, NULL, key);
+#endif
+	}
+	return ptr;
+}
 #define ut_zalloc_nokey(n_bytes)	::calloc(1, n_bytes)
+
+static inline void *ut_zalloc_dontdump(ulint n_bytes, ut_new_pfx_t *key)
+{
+	void *ptr = os_mem_alloc_large(&n_bytes);
+	key->m_size = n_bytes;
+	if (ptr)
+	{
+#if defined(DBUG_OFF) && defined(HAVE_MADVISE) && defined(MADV_DONTDUMP)
+		if (madvise(ptr, n_bytes, MADV_DONTDUMP))
+		{
+			ib::warn() << "Failed to set memory to DONTDUMP: " << strerror(errno);
+		}
+#endif
+#ifdef UNIV_PFS_MEMORY
+		allocate_trace(n_bytes, NULL, key);
+#endif
+		::memset(ptr, 1, n_bytes);
+	}
+	return ptr;
+}
 
 #define ut_zalloc_nokey_nofatal(n_bytes)	::calloc(1, n_bytes)
 
 #define ut_realloc(ptr, n_bytes)	::realloc(ptr, n_bytes)
 
 #define ut_free(ptr)			::free(ptr)
+
+static inline void ut_free_dodump(void *ptr, ut_new_pfx_t *key)
+{
+	if (ptr)
+	{
+#if defined(DBUG_OFF) && defined(HAVE_MADVISE) && defined(MADV_DODUMP)
+		if (madvise(ptr, key->m_size, MADV_DODUMP))
+		{
+			ib::warn() << "Failed to set memory to DODUMP: " << strerror(errno);
+		}
+#endif
+#ifdef UNIV_PFS_MEMORY
+		deallocate_trace(pfx);
+#endif
+	}
+	os_mem_free_large(ptr, key->m_size);
+}
 
 #endif /* UNIV_PFS_MEMORY */
 
